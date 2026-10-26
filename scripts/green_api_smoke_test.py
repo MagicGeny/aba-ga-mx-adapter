@@ -11,17 +11,19 @@ Usage:
     python scripts/green_api_smoke_test.py --send-and-wait-read
 
 Before running:
+
     1. Copy .env.example to .env and fill in your GREEN-API credentials.
     2. Ensure the MAX instance has:
        - webhookUrl cleared (empty)
        - outgoingMessageWebhook, outgoingAPIMessageWebhook, outgoingWebhook enabled
     3. Use a dedicated test instance with an empty notification queue.
 
-This script NEVER sends messages automatically.  You must explicitly pass a
+This script NEVER sends messages automatically. You must explicitly pass a
 mode and, for full runs, confirm by typing SEND.
 
 See docs/adapter-contract.md for the full adapter contract.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -54,21 +56,35 @@ SMOKE_TEST_TIMEOUT_SECONDS = int(
 )
 
 # GREEN-API ReceiveNotification receiveTimeout range (seconds).
+# See: https://green-api.com/v3/docs/api/receiving/technology-http-api/ReceiveNotification/
 RECEIVE_TIMEOUT_MIN = 5
 RECEIVE_TIMEOUT_MAX = 60
 RECEIVE_TIMEOUT_DEFAULT = 10
 
-# Phone number validation: digits only, 7-15 digits (GREEN-API requirement:
-# "must contain only digits").  GREEN-API MAX specifically restricts to
-# 11-12 digits with RF ("7") / RB ("375") prefixes; the server enforces that
-# and returns a 400 on mismatch.
-PHONE_REGEX = re.compile(r"^\d{7,15}$")
+# The generic HTTP client timeout (HTTP_TIMEOUT_DEFAULT) is intentionally
+# shorter than the longest allowed long-poll (RECEIVE_TIMEOUT_MAX). Each
+# ReceiveNotification request therefore overrides it with
+# receiveTimeout + RECEIVE_TIMEOUT_MARGIN_SECONDS, so a server-side long poll
+# is never cut off by the shorter generic timeout.
+HTTP_TIMEOUT_DEFAULT = 30.0
+RECEIVE_TIMEOUT_MARGIN_SECONDS = 15.0
 
-# GREEN-API OutgoingMessageStatus terminal status values.
+# GREEN-API MAX CheckAccount phone requirements:
+#   * digits only (no '+', spaces, or separators);
+#   * 11 digits beginning with '7' for Russian numbers;
+#   * 12 digits beginning with '375' for Belarusian numbers.
+# See: https://green-api.com/v3/docs/api/service/CheckAccount/
+PHONE_REGEX = re.compile(r"^(?:7\d{10}|375\d{9})$")
+
+# SendMessage text length limit enforced by GREEN-API MAX.
+MAX_TEST_MESSAGE_LENGTH = 4000
+
+# Terminal statuses from OutgoingMessageStatus notifications.
 TERMINAL_STATUSES = {"read", "failed", "noAccount", "notInGroup"}
 
-# The notification type for outgoing message status.
-STATUS_NOTIFICATION_TYPE = "outgoingMessageStatus"
+# Execution modes.
+MODE_CHECK_ONLY = "check_only"
+MODE_SEND_AND_WAIT_READ = "send_and_wait_read"
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +108,7 @@ def _log_warn(msg: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# URL helpers
+# URL building
 # ---------------------------------------------------------------------------
 
 def _normalize_base_url(base_url: str) -> str:
@@ -100,25 +116,32 @@ def _normalize_base_url(base_url: str) -> str:
     return base_url.rstrip("/")
 
 
-def _sanitize_url(url: str) -> str:
-    """Return a URL with the API token masked for logging.
+# The GREEN-API token is the path segment immediately after the method name.
+# For deleteNotification the receiptId follows the token, so everything after
+# the method name must be masked, not just the last path segment.
+_SENSITIVE_PATH_RE = re.compile(
+    r"/(checkAccount|sendMessage|receiveNotification|deleteNotification)"
+    r"(?:/[^\s?]*)?(?:\?[^\s]*)?$"
+)
 
-    GREEN-API places the API token in the URL path.  We must never print it.
+
+def _sanitize_url(url: str) -> str:
+    """Return a URL with the token portion masked for logging.
+
+    GREEN-API places the API token in the URL path. For ``deleteNotification``
+    the ``receiptId`` follows the token, so the whole tail after the method
+    name is masked. We must never print the token.
     """
-    parts = url.split("/")
-    if len(parts) >= 2 and parts[-1]:
-        parts[-1] = "***"
-    return "/".join(parts)
+    return _SENSITIVE_PATH_RE.sub(r"/\1/<hidden>", url)
 
 
 # ---------------------------------------------------------------------------
-# Data models
+# Data models (lightweight, no pydantic dependency needed for smoke test)
 # ---------------------------------------------------------------------------
 
 @dataclass
 class CheckAccountResult:
-    """Parsed response from the GREEN-API CheckAccount method."""
-
+    """Result of a CheckAccount API call."""
     exist: bool
     chat_id: Optional[str]
     from_cache: Optional[bool]
@@ -126,27 +149,19 @@ class CheckAccountResult:
 
     @property
     def has_valid_chat(self) -> bool:
-        """True when exist=true and a non-empty chatId was returned."""
-        return self.exist and bool(self.chat_id)
+        return self.exist and self.chat_id is not None and self.chat_id != ""
 
 
 @dataclass
 class SendMessageResult:
-    """Parsed response from the GREEN-API SendMessage method."""
-
+    """Result of a SendMessage API call."""
     id_message: str
     raw_response: dict[str, Any]
 
 
 @dataclass
 class Notification:
-    """A single notification extracted from a ReceiveNotification response.
-
-    The ReceiveNotification API wraps the notification in a *body* field:
-
-        {"receiptId": 1234567, "body": {"typeWebhook": "outgoingMessageStatus", ...}}
-    """
-
+    """A notification returned by ReceiveNotification."""
     receipt_id: Optional[int]
     type_webhook: Optional[str]
     id_message: Optional[str]
@@ -157,38 +172,30 @@ class Notification:
     raw_body: dict[str, Any]
 
     @classmethod
-    def from_raw(cls, item: dict[str, Any]) -> "Notification":
-        """Parse one ReceiveNotification envelope into a Notification."""
-        body = item.get("body")
-        if not isinstance(body, dict):
-            body = {}
+    def from_raw(cls, notification: dict[str, Any]) -> "Notification":
+        """Parse a ReceiveNotification item into a Notification object."""
+        body = notification.get("body", {})
+        if isinstance(body, dict):
+            return cls(
+                receipt_id=notification.get("receiptId"),
+                type_webhook=body.get("typeWebhook"),
+                id_message=body.get("idMessage"),
+                status=body.get("status"),
+                chat_id=body.get("chatId"),
+                description=body.get("description"),
+                timestamp=body.get("timestamp"),
+                raw_body=dict(body),
+            )
         return cls(
-            receipt_id=item.get("receiptId"),
-            type_webhook=body.get("typeWebhook"),
-            id_message=body.get("idMessage"),
-            status=body.get("status"),
-            chat_id=body.get("chatId"),
-            description=body.get("description"),
-            timestamp=body.get("timestamp"),
-            raw_body=dict(body),
+            receipt_id=notification.get("receiptId"),
+            type_webhook=None,
+            id_message=None,
+            status=None,
+            chat_id=None,
+            description=None,
+            timestamp=None,
+            raw_body=body if isinstance(body, dict) else {},
         )
-
-    @property
-    def is_status_notification(self) -> bool:
-        """True for an outgoing-message-status notification."""
-        return self.type_webhook == STATUS_NOTIFICATION_TYPE
-
-    def is_for_message(self, id_message: str) -> bool:
-        """True when this is an outgoingMessageStatus for *id_message*."""
-        return (
-            self.is_status_notification
-            and self.id_message is not None
-            and self.id_message == id_message
-        )
-
-    def is_unrelated(self, id_message: str) -> bool:
-        """True when this notification does not belong to *id_message*."""
-        return not self.is_for_message(id_message)
 
 
 # ---------------------------------------------------------------------------
@@ -199,12 +206,22 @@ class ConfigError(Exception):
     """Raised when configuration is missing or invalid."""
 
 
-def validate_config() -> None:
-    """Validate that all required environment variables are set correctly.
+def validate_config(mode: str = MODE_SEND_AND_WAIT_READ) -> None:
+    """Validate that all required configuration is present and correct.
 
-    Raises ConfigError with a safe diagnostic (no credentials).
+    Validation is mode-aware:
+
+    * ``MODE_CHECK_ONLY`` only needs the instance credentials and a valid test
+      phone number. It never sends, so ``TEST_MESSAGE`` is not required.
+    * ``MODE_SEND_AND_WAIT_READ`` additionally requires a non-empty test
+      message no longer than ``MAX_TEST_MESSAGE_LENGTH`` characters.
+
+    Does NOT make any API calls.
     """
-    missing: list[str] = []
+    if mode not in (MODE_CHECK_ONLY, MODE_SEND_AND_WAIT_READ):
+        raise ConfigError(f"Unknown mode: {mode!r}")
+
+    missing = []
     if not GREEN_API_BASE_URL:
         missing.append("GREEN_API_BASE_URL")
     if not GREEN_API_ID_INSTANCE:
@@ -213,126 +230,163 @@ def validate_config() -> None:
         missing.append("GREEN_API_TOKEN_INSTANCE")
     if not TEST_PHONE_NUMBER:
         missing.append("TEST_PHONE_NUMBER")
-    if not TEST_MESSAGE:
+    if mode == MODE_SEND_AND_WAIT_READ and not TEST_MESSAGE:
         missing.append("TEST_MESSAGE")
+
     if missing:
         raise ConfigError(
-            "Missing required configuration: " + ", ".join(missing)
-            + ". Copy .env.example to .env and fill in the values."
+            f"Missing required configuration: {', '.join(missing)}.\n"
+            f"Copy .env.example to .env and fill in all values."
         )
 
+    if not GREEN_API_BASE_URL.startswith(("http://", "https://")):
+        raise ConfigError(
+            "GREEN_API_BASE_URL must start with http:// or https://"
+        )
+
+    # GREEN-API MAX CheckAccount accepts only digits: 11 digits beginning with
+    # '7' (RU) or 12 digits beginning with '375' (BY).
     if not PHONE_REGEX.match(TEST_PHONE_NUMBER):
         raise ConfigError(
-            "TEST_PHONE_NUMBER is invalid. Expected 7-15 digits only "
-            "(GREEN-API requires digits, no '+', no spaces), got: "
-            f"{TEST_PHONE_NUMBER!r}"
+            "TEST_PHONE_NUMBER must be digits only, either 11 digits starting "
+            "with '7' (RU) or 12 digits starting with '375' (BY), without '+' "
+            f"or separators: got {TEST_PHONE_NUMBER!r}"
         )
 
-    if not GREEN_API_BASE_URL.startswith("https://"):
-        raise ConfigError("GREEN_API_BASE_URL must start with 'https://'.")
+    if mode == MODE_SEND_AND_WAIT_READ:
+        if len(TEST_MESSAGE) > MAX_TEST_MESSAGE_LENGTH:
+            raise ConfigError(
+                f"TEST_MESSAGE must be at most {MAX_TEST_MESSAGE_LENGTH} "
+                f"characters: got {len(TEST_MESSAGE)}."
+            )
 
 
 # ---------------------------------------------------------------------------
-# JSON / error helpers
+# API error handling helpers
 # ---------------------------------------------------------------------------
+
+def _safe_error_detail(operation: str, exc: BaseException) -> str:
+    """Build a secret-safe error description for a failed HTTP request.
+
+    Only the operation name and the exception *type* are used. The raw
+    exception string is deliberately excluded because HTTPX embeds the full
+    request URL (including the API token) in its messages.
+    """
+    return f"{operation}: request failed ({type(exc).__name__})."
+
 
 def _safe_parse_json(resp: httpx.Response, context: str) -> Any:
-    """Safely parse a JSON response body."""
+    """Parse JSON safely, without ever logging the response body."""
     try:
         return resp.json()
-    except (ValueError, TypeError) as exc:
+    except Exception:
+        content_type = resp.headers.get("content-type", "unknown")
         raise ConfigError(
-            f"{context}: failed to parse JSON response ({exc}). "
-            f"HTTP {resp.status_code}."
-        ) from exc
+            f"{context}: failed to parse JSON response. "
+            f"HTTP {resp.status_code}. Content-Type: {content_type}."
+        )
 
 
-def _raise_api_error(method: str, resp: httpx.Response) -> None:
+def _raise_api_error(operation: str, resp: httpx.Response) -> None:
     """Raise a ConfigError with a safe diagnostic from an API error response.
 
-    GREEN-API standard error responses contain ``error_code`` and
-    ``error_message`` fields, or sometimes ``status`` / ``reason``.
-    No credentials are included in the message.
+    Never logs the token, the full URL, or the complete response body. Only
+    the HTTP status and GREEN-API's structured ``code``/``message`` fields are
+    used, and the message is truncated.
     """
-    status_code = resp.status_code
-    detail = ""
     try:
         data = resp.json()
-        if isinstance(data, dict):
-            if data.get("error_message"):
-                detail = f" - {data['error_message']}"
-            elif data.get("message"):
-                detail = f" - {data['message']}"
-            elif data.get("reason"):
-                detail = f" - {data['reason']}"
-            elif data.get("error_code") is not None:
-                detail = f" - error_code={data['error_code']}"
-    except (ValueError, TypeError):
-        pass
-    raise ConfigError(f"{method} API error: HTTP {status_code}{detail}")
+    except Exception:
+        data = None
+
+    error_code = None
+    error_message = None
+    if isinstance(data, dict):
+        error_code = data.get("code") or data.get("error_code")
+        error_message = data.get("message") or data.get("error_message")
+        if error_message is None:
+            error_message = data.get("reason")
+
+    status = resp.status_code
+
+    if status == 401:
+        detail = "Authorization failed (invalid idInstance or apiTokenInstance)."
+    elif status == 429:
+        detail = "Rate limited by GREEN-API. Wait before retrying."
+    elif status == 400:
+        detail = "Bad request (HTTP 400). Check request parameters."
+    elif status == 403:
+        detail = "Forbidden (HTTP 403). Check instance access."
+    elif status == 404:
+        detail = "Not found (HTTP 404). Check GREEN_API_BASE_URL and endpoint path."
+    else:
+        detail = f"HTTP {status}"
+
+    if error_message:
+        detail = f"{detail} GREEN-API message: {str(error_message)[:300]}"
+    if error_code:
+        detail = f"{detail} GREEN-API code: {error_code}"
+
+    raise ConfigError(f"{operation} API error: {detail}")
 
 
 # ---------------------------------------------------------------------------
-# GREEN-API client
+# API client
 # ---------------------------------------------------------------------------
 
 class GreenApiClient:
-    """Thin HTTP client for the GREEN-API MAX HTTP API."""
+    """Minimal GREEN-API MAX HTTP client for smoke testing."""
 
-    def __init__(
-        self,
-        base_url: str,
-        id_instance: str,
-        token: str,
-        timeout: float = 30.0,
-    ) -> None:
+    def __init__(self, base_url: str, id_instance: str, token: str,
+                 timeout: float = HTTP_TIMEOUT_DEFAULT):
         self._base_url = _normalize_base_url(base_url)
         self._id_instance = id_instance
         self._token = token
         self._timeout = timeout
         self._client: Optional[httpx.Client] = None
 
-    # -- internal helpers --------------------------------------------------
-
     def _get_client(self) -> httpx.Client:
-        """Return a lazily-created httpx client."""
         if self._client is None:
-            self._client = httpx.Client(timeout=self._timeout)
+            self._client = httpx.Client(
+                timeout=httpx.Timeout(self._timeout),
+                base_url=self._base_url,
+                headers={"Content-Type": "application/json"},
+            )
         return self._client
 
-    def _wa_url(self, method_name: str) -> str:
-        """Build a GREEN-API v3 waInstance URL (token is never printed)."""
+    def _wa_url(self, method: str) -> str:
+        """Build a GREEN-API waInstance URL.
+
+        The token is part of the path. This method does NOT sanitize.
+        """
         return (
-            f"{self._base_url}/waInstance"
-            f"{self._id_instance}/{method_name}/{self._token}"
+            f"{self._base_url}/waInstance{self._id_instance}"
+            f"/{method}/{self._token}"
         )
 
-    # -- CheckAccount -----------------------------------------------------
+    def _receive_request_timeout(self, receive_timeout: int) -> float:
+        """HTTP timeout for a ReceiveNotification long-poll request.
 
-    def check_account(
-        self, phone_number: str, force: bool = False
-    ) -> CheckAccountResult:
-        """Call GREEN-API CheckAccount.
-
-        See: https://green-api.com/v3/docs/api/service/CheckAccount/
-
-        ``force`` defaults to ``False`` per the contract (use the 2-hour cache).
-        ``phoneNumber`` is sent as an integer per the documented type.
+        Longer than the selected ``receiveTimeout`` so the server-side long
+        poll is never cut off by the shorter generic HTTP timeout.
         """
-        body: dict[str, Any] = {"phoneNumber": int(phone_number)}
+        return float(receive_timeout) + RECEIVE_TIMEOUT_MARGIN_SECONDS
+
+    def check_account(self, phone_number: str, force: bool = False) -> CheckAccountResult:
+        """Call CheckAccount API. See docs for details."""
+        body: dict[str, Any] = {"phoneNumber": phone_number}
         if force:
             body["force"] = True
 
-        _log("CheckAccount -> sending request (URL hidden)")
+        url = self._wa_url("checkAccount")
+        _log(f"CheckAccount -> {_sanitize_url(url)}")
 
         try:
-            resp = self._get_client().post(
-                self._wa_url("checkAccount"), json=body
-            )
-        except httpx.TimeoutException as exc:
-            raise ConfigError(f"CheckAccount request timed out: {exc}") from exc
-        except httpx.ConnectError as exc:
-            raise ConfigError(f"CheckAccount connection failed: {exc}") from exc
+            resp = self._get_client().post(url, json=body)
+        except httpx.TimeoutException:
+            raise ConfigError("CheckAccount request timed out.")
+        except httpx.HTTPError as exc:
+            raise ConfigError(_safe_error_detail("CheckAccount", exc))
 
         if resp.status_code != 200:
             _raise_api_error("CheckAccount", resp)
@@ -341,75 +395,46 @@ class GreenApiClient:
 
         if not isinstance(data, dict):
             raise ConfigError(
-                "CheckAccount returned a non-object response: "
-                f"{type(data).__name__}"
+                f"CheckAccount returned non-object response: {type(data).__name__}"
             )
 
-        # GREEN-API returns {"status": false, "reason": "..."} for
-        # instance-not-ready or rate-limit conditions.  These are NOT
-        # proof that the recipient doesn't exist.
-        if "exist" not in data:
-            if data.get("status") is False:
-                reason = data.get("reason", "unknown")
-                raise ConfigError(
-                    f"CheckAccount reports an instance-level error: {reason}. "
-                    "This is NOT proof that the recipient is absent."
-                )
-            raise ConfigError(
-                f"CheckAccount response missing 'exist' field: {data}"
-            )
-
+        response_copy = dict(data)
         exist = data.get("exist")
         chat_id = data.get("chatId")
         from_cache = data.get("fromCache")
 
+        if exist is None:
+            raise ConfigError(
+                "CheckAccount response missing 'exist' field "
+                f"(response keys: {sorted(response_copy)})."
+            )
+
         if not exist:
             chat_id = None
             from_cache = None
+            response_copy = {"exist": False}
 
-        result = CheckAccountResult(
+        return CheckAccountResult(
             exist=bool(exist),
             chat_id=chat_id if isinstance(chat_id, str) else None,
             from_cache=bool(from_cache) if from_cache is not None else None,
-            raw_response=dict(data),
+            raw_response=response_copy,
         )
 
-        if result.exist and result.from_cache is not None:
-            _log(
-                f"CheckAccount OK: exist={result.exist}, "
-                f"chatId={result.chat_id}, fromCache={result.from_cache}"
-            )
-        elif result.exist:
-            _log(
-                f"CheckAccount OK: exist={result.exist}, "
-                f"chatId={result.chat_id}"
-            )
-
-        return result
-
-    # -- SendMessage ------------------------------------------------------
-
     def send_message(self, chat_id: str, message: str) -> SendMessageResult:
-        """Call GREEN-API SendMessage.
-
-        See: https://green-api.com/v3/docs/api/sending/SendMessage/
-
-        Sends JSON containing ``chatId`` and ``message``.
-        """
-        body: dict[str, Any] = {"chatId": chat_id, "message": message}
-        _log("SendMessage -> sending request (URL hidden)")
+        """Call SendMessage API. See docs for details."""
+        body = {"chatId": chat_id, "message": message}
+        _log("SendMessage -> sending message (URL hidden)")
 
         try:
-            resp = self._get_client().post(
-                self._wa_url("sendMessage"), json=body
-            )
-        except httpx.TimeoutException as exc:
+            resp = self._get_client().post(self._wa_url("sendMessage"), json=body)
+        except httpx.TimeoutException:
             raise ConfigError(
-                f"SendMessage request timed out: {exc}. The message MAY "
-                "have been sent. Check the recipient's device before retrying."
-            ) from exc
-        except httpx.ConnectError as exc:
-            raise ConfigError(f"SendMessage connection failed: {exc}") from exc
+                "SendMessage request timed out. The message MAY have been sent. "
+                "Check the recipient's device before retrying."
+            )
+        except httpx.HTTPError as exc:
+            raise ConfigError(_safe_error_detail("SendMessage", exc))
 
         if resp.status_code != 200:
             _raise_api_error("SendMessage", resp)
@@ -418,49 +443,49 @@ class GreenApiClient:
 
         if not isinstance(data, dict):
             raise ConfigError(
-                f"SendMessage returned a non-object response: "
-                f"{type(data).__name__}"
+                f"SendMessage returned non-object response: {type(data).__name__}"
             )
 
         id_message = data.get("idMessage")
         if not id_message or not isinstance(id_message, str):
-            raise ConfigError(
-                f"SendMessage response missing 'idMessage': {data}"
-            )
+            raise ConfigError("SendMessage response missing 'idMessage'.")
 
         _log(f"SendMessage accepted. idMessage={id_message}")
-        return SendMessageResult(
-            id_message=id_message, raw_response=dict(data)
-        )
+        return SendMessageResult(id_message=id_message, raw_response=dict(data))
 
-    # -- ReceiveNotification ----------------------------------------------
+    # -- ReceiveNotification / DeleteNotification ---------------------------
 
     def receive_notification(
         self, receive_timeout: int = RECEIVE_TIMEOUT_DEFAULT
     ) -> Optional[list[dict[str, Any]]]:
-        """Call GREEN-API ReceiveNotification.
+        """Call ReceiveNotification API.
 
         See: https://green-api.com/v3/docs/api/receiving/technology-http-api/ReceiveNotification/
 
-        ``receive_timeout``: 5-60 seconds (GREEN-API documented range).
-        Returns a list of notification envelopes, or ``None`` if no
-        notification was available within the timeout.
+        receive_timeout: 5-60 seconds (GREEN-API documented range).
+        Returns the list of notifications, or None if no notifications.
         """
         if not (RECEIVE_TIMEOUT_MIN <= receive_timeout <= RECEIVE_TIMEOUT_MAX):
             receive_timeout = RECEIVE_TIMEOUT_DEFAULT
+
+        request_timeout = self._receive_request_timeout(receive_timeout)
+        _log(
+            f"ReceiveNotification (receiveTimeout={receive_timeout}s, "
+            f"httpTimeout={request_timeout:g}s)"
+        )
 
         try:
             resp = self._get_client().get(
                 self._wa_url("receiveNotification"),
                 params={"receiveTimeout": receive_timeout},
+                timeout=request_timeout,
             )
         except httpx.TimeoutException:
-            # A timeout here just means no notification was available.
+            # ReceiveNotification timeout just means no notification was
+            # available within the window.
             return None
-        except httpx.ConnectError as exc:
-            raise ConfigError(
-                f"ReceiveNotification connection failed: {exc}"
-            ) from exc
+        except httpx.HTTPError as exc:
+            raise ConfigError(_safe_error_detail("ReceiveNotification", exc))
 
         if resp.status_code != 200:
             _raise_api_error("ReceiveNotification", resp)
@@ -473,349 +498,170 @@ class GreenApiClient:
         if isinstance(data, list):
             return data
         if isinstance(data, dict):
-            # An empty dict means "no notification" (timeout).
-            if not data:
-                return None
             return [data]
         return None
 
-    # -- DeleteNotification -----------------------------------------------
-
-    def delete_notification(self, receipt_id: int) -> tuple[bool, str]:
-        """Call GREEN-API DeleteNotification.
+    def delete_notification(self, receipt_id: int) -> bool:
+        """Delete a processed notification.
 
         See: https://green-api.com/v3/docs/api/receiving/technology-http-api/DeleteNotification/
 
-        DELETE {base}/waInstance{id}/deleteNotification/{token}/{receiptId}
-
-        Returns ``(success, reason)`` where *reason* is an empty string on
-        success.
+        The API expects the receipt id in the URL path, after the token:
+            DELETE /waInstance{idInstance}/deleteNotification/{token}/{receiptId}
         """
         url = f"{self._wa_url('deleteNotification')}/{receipt_id}"
-        _log(
-            f"DeleteNotification -> sending request "
-            f"(receiptId={receipt_id}, URL hidden)"
-        )
+        _log(f"DeleteNotification -> {_sanitize_url(url)}")
 
         try:
-            resp = self._get_client().delete(url)
-        except httpx.TimeoutException as exc:
-            raise ConfigError(
-                f"DeleteNotification request timed out: {exc}"
-            ) from exc
-        except httpx.ConnectError as exc:
-            raise ConfigError(
-                f"DeleteNotification connection failed: {exc}"
-            ) from exc
+            resp = self._get_client().delete(url, timeout=self._timeout)
+        except httpx.TimeoutException:
+            raise ConfigError("DeleteNotification request timed out.")
+        except httpx.HTTPError as exc:
+            raise ConfigError(_safe_error_detail("DeleteNotification", exc))
 
         if resp.status_code != 200:
             _raise_api_error("DeleteNotification", resp)
 
         data = _safe_parse_json(resp, "DeleteNotification")
 
-        if not isinstance(data, dict):
-            raise ConfigError(
-                f"DeleteNotification returned a non-object response: "
-                f"{type(data).__name__}"
-            )
-
-        success = bool(data.get("result", False))
-        reason = data.get("reason", "") or ""
-        if not isinstance(reason, str):
-            reason = str(reason)
-
-        return success, reason
-
-    # -- lifecycle --------------------------------------------------------
-
-    def close(self) -> None:
-        """Close the underlying HTTP client."""
-        if self._client is not None:
-            self._client.close()
-            self._client = None
+        if isinstance(data, dict):
+            return bool(data.get("result", True))
+        return True
 
 
 # ---------------------------------------------------------------------------
-# Operator confirmation
+# Smoke-test flows
 # ---------------------------------------------------------------------------
 
-def confirm_send(phone: str, message: str) -> None:
-    """Display the recipient and message, then require the operator to type SEND."""
-    _log("=" * 60)
-    _log("READY TO SEND A TEST MESSAGE")
-    _log(f"  Recipient phone: {phone}")
-    _log(f"  Message text:    {message}")
-    _log("=" * 60)
-    _log("Type SEND to confirm and proceed (anything else cancels):")
-    try:
-        response = input("> ").strip()
-    except EOFError:
-        response = ""
-    if response != "SEND":
-        _log("Aborted by operator. No message was sent.")
-        sys.exit(0)
-
-
-# ---------------------------------------------------------------------------
-# Orchestration: --check-only
-# ---------------------------------------------------------------------------
-
-def run_check_only(client: GreenApiClient, phone: str) -> int:
-    """Run only the CheckAccount step."""
-    _log(f"Running CheckAccount for phone: {phone}")
-    try:
-        result = client.check_account(phone)
-    except ConfigError as exc:
-        _log_error(str(exc))
-        return 1
-
-    if not result.exist:
-        _log(
-            f"CheckAccount: recipient does NOT have a MAX account "
-            f"(exist={result.exist}, chatId='{result.chat_id}'). "
-            "Stopping without sending."
-        )
-        return 0
-
-    if not result.has_valid_chat:
-        _log_error(
-            "CheckAccount returned exist=true but no valid chatId. "
-            "Stopping without sending."
-        )
-        return 1
-
-    _log(
-        f"CheckAccount: recipient has a MAX account. "
-        f"chatId={result.chat_id}, fromCache={result.from_cache}"
-    )
-    _log("Check successful. No message was sent (--check-only mode).")
-    return 0
-
-
-# ---------------------------------------------------------------------------
-# Orchestration: --send-and-wait-read
-# ---------------------------------------------------------------------------
-
-def run_send_and_wait_read(
-    client: GreenApiClient,
-    phone: str,
-    message: str,
-    timeout_seconds: int,
-) -> int:
-    """Run the full smoke-test sequence.
-
-    CheckAccount -> SendMessage -> ReceiveNotification -> wait for 'read'
-    """
-    # --- 1. CheckAccount ------------------------------------------------
-    _log(f"Step 1: CheckAccount for phone: {phone}")
-    try:
-        result = client.check_account(phone)
-    except ConfigError as exc:
-        _log_error(f"CheckAccount failed: {exc}")
-        return 1
-
-    if not result.exist:
-        _log(
-            f"CheckAccount: recipient does NOT have a MAX account "
-            f"(exist={result.exist}). Stopping without sending."
-        )
-        return 1
-
-    if not result.has_valid_chat or not result.chat_id:
-        _log_error(
-            "CheckAccount returned exist=true but no valid chatId. "
-            "Stopping without sending."
-        )
-        return 1
-
-    _log(
-        f"Step 1 complete: exist={result.exist}, "
-        f"chatId={result.chat_id}, fromCache={result.from_cache}"
-    )
-
-    # --- 2. Confirm with operator --------------------------------------
-    confirm_send(phone, message)
-
-    # --- 3. SendMessage --------------------------------------------------
-    _log("Step 2: SendMessage")
-    try:
-        send_result = client.send_message(result.chat_id, message)
-    except ConfigError as exc:
-        _log_error(f"SendMessage failed: {exc}")
-        return 1
-
-    id_message = send_result.id_message
-    _log(f"Step 2 complete: SendMessage accepted. idMessage={id_message}")
-    _log(
-        "NOTE: SendMessage success means the request was ACCEPTED, "
-        "not that the message was delivered or read."
-    )
-
-    # --- 4. ReceiveNotification -> wait for read -----------------------
-    _log(
-        f"Step 3: Polling ReceiveNotification for 'read' status "
-        f"(idMessage={id_message}, timeout={timeout_seconds}s)"
-    )
-    _log("  Open the delivered test message on the recipient's device.")
-
-    start_time = time.monotonic()
-    last_intermediate: Optional[str] = None
-
-    while True:
-        elapsed = time.monotonic() - start_time
-        remaining = timeout_seconds - elapsed
-
-        if remaining <= 0:
-            _log_error(
-                f"Timeout ({timeout_seconds}s) reached. No 'read' status "
-                f"received for idMessage={id_message}."
-            )
-            if last_intermediate:
-                _log(f"  Last observed status: {last_intermediate}")
-            _log(
-                "  The message may still be waiting for the recipient to open it."
-            )
-            return 1
-
-        receive_timeout = max(
-            RECEIVE_TIMEOUT_MIN,
-            min(RECEIVE_TIMEOUT_MAX, int(remaining)),
-        )
-
-        try:
-            items = client.receive_notification(receive_timeout)
-        except ConfigError as exc:
-            _log_error(f"ReceiveNotification failed: {exc}")
-            return 1
-
-        if items is None:
-            elapsed = time.monotonic() - start_time
-            _log(
-                f"  No notification yet (elapsed {elapsed:.0f}s/"
-                f"{timeout_seconds}s). Continuing to poll..."
-            )
-            continue
-
-        for item in items:
-            notif = Notification.from_raw(item)
-
-            # --- Unrelated notification: report and stop, do NOT delete ---
-            if notif.is_unrelated(id_message):
-                _log_warn(
-                    f"Queue contains an UNRELATED notification: "
-                    f"typeWebhook={notif.type_webhook!r}, "
-                    f"idMessage={notif.id_message!r}, "
-                    f"status={notif.status!r}"
-                )
-                _log_warn(
-                    "This notification does not belong to the test message. "
-                    "It will NOT be deleted. Stopping."
-                )
-                _log_warn(
-                    "For a clean run, use a dedicated test instance "
-                    "with an empty notification queue."
-                )
-                return 1
-
-            status = notif.status
-            _log(
-                f"  Received outgoingMessageStatus: status={status} "
-                f"idMessage={notif.id_message}"
-            )
-
-            # Delete the handled notification from the queue.
-            if notif.receipt_id is not None:
-                try:
-                    deleted, reason = client.delete_notification(notif.receipt_id)
-                    if deleted:
-                        _log(f"  Deleted notification (receiptId={notif.receipt_id})")
-                    else:
-                        _log_warn(
-                            f"  DeleteNotification result=false for "
-                            f"receiptId={notif.receipt_id}: {reason or 'unknown'}"
-                        )
-                except ConfigError as exc:
-                    _log_warn(f"  DeleteNotification failed: {exc}")
-            else:
-                _log_warn("  Notification has no receiptId; cannot delete.")
-
-            # --- Evaluate status ---
-            if status == "read":
-                _log(
-                    f"SUCCESS: recipient READ the message "
-                    f"(idMessage={id_message})."
-                )
-                return 0
-
-            if status in TERMINAL_STATUSES:
-                _log_error(
-                    f"Terminal error status '{status}' for idMessage={id_message}."
-                )
-                if notif.description:
-                    _log(f"  Description: {notif.description}")
-                return 1
-
-            # Intermediate status (delivered, or any non-terminal value).
-            last_intermediate = status
-            _log(f"  Intermediate status '{status}'. Waiting for 'read'...")
-
-    return 1  # Unreachable — the loop always returns or times out.
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="green_api_smoke_test",
-        description="GREEN-API MAX smoke test: "
-        "CheckAccount -> SendMessage -> ReceiveNotification -> read",
-    )
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        "--check-only",
-        action="store_true",
-        help="Call CheckAccount only. Do NOT send a message or poll the "
-        "notification queue.",
-    )
-    group.add_argument(
-        "--send-and-wait-read",
-        action="store_true",
-        help="Run the full smoke test: CheckAccount -> SendMessage -> "
-        "ReceiveNotification -> wait for 'read' status.",
-    )
-    args = parser.parse_args(argv)
-
-    try:
-        validate_config()
-    except ConfigError as exc:
-        _log_error(f"Configuration error: {exc}")
-        return 1
-
-    client = GreenApiClient(
+def _build_client() -> GreenApiClient:
+    return GreenApiClient(
         base_url=GREEN_API_BASE_URL,
         id_instance=GREEN_API_ID_INSTANCE,
         token=GREEN_API_TOKEN_INSTANCE,
+        timeout=HTTP_TIMEOUT_DEFAULT,
     )
 
+
+def _confirm_send(chat_id: str, message: str) -> bool:
+    """Ask the operator to explicitly confirm sending a real message."""
+    _log_warn("About to send a REAL message through GREEN-API MAX.")
+    print(f"  chatId: {chat_id}")
+    preview = message if len(message) <= 120 else f"{message[:120]}..."
+    print(f"  message ({len(message)} chars): {preview}")
+    try:
+        answer = input("Type SEND to confirm, or anything else to abort: ")
+    except EOFError:
+        answer = ""
+    if answer.strip() != "SEND":
+        _log("Confirmation not provided; aborting without sending.")
+        return False
+    return True
+
+
+def run_check_only() -> int:
+    """Validate configuration and run CheckAccount only. Never sends."""
+    validate_config(MODE_CHECK_ONLY)
+    client = _build_client()
+
+    result = client.check_account(TEST_PHONE_NUMBER)
+    if result.has_valid_chat:
+        _log(f"CheckAccount OK: exist=True chatId={result.chat_id}")
+        return 0
+
+    _log_error("CheckAccount: no MAX account for the configured test phone number.")
+    return 2
+
+
+def run_send_and_wait_read() -> int:
+    """Validate, confirm, send one message, then wait for the read status."""
+    validate_config(MODE_SEND_AND_WAIT_READ)
+    client = _build_client()
+
+    check = client.check_account(TEST_PHONE_NUMBER)
+    if not check.has_valid_chat:
+        raise ConfigError(
+            "CheckAccount found no MAX chat for the configured test phone number."
+        )
+
+    if not _confirm_send(check.chat_id, TEST_MESSAGE):
+        return 1
+
+    deadline = time.monotonic() + SMOKE_TEST_TIMEOUT_SECONDS
+    sent = client.send_message(check.chat_id, TEST_MESSAGE)
+    _log(
+        f"Waiting up to {SMOKE_TEST_TIMEOUT_SECONDS}s for "
+        f"outgoingMessageStatus: read ..."
+    )
+
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        if remaining < RECEIVE_TIMEOUT_MIN:
+            break
+        poll_timeout = int(min(RECEIVE_TIMEOUT_DEFAULT, remaining))
+        poll_timeout = max(RECEIVE_TIMEOUT_MIN, poll_timeout)
+
+        notifications = client.receive_notification(receive_timeout=poll_timeout)
+        if not notifications:
+            continue
+
+        for notification in notifications:
+            if notification.receipt_id is not None:
+                try:
+                    client.delete_notification(notification.receipt_id)
+                except ConfigError as exc:
+                    _log_warn(f"Could not delete notification: {exc}")
+
+            if (
+                notification.type_webhook == "outgoingMessageStatus"
+                and notification.id_message == sent.id_message
+                and notification.status
+            ):
+                _log(f"outgoingMessageStatus: {notification.status}")
+                if notification.status in TERMINAL_STATUSES:
+                    if notification.status == "read":
+                        _log("Smoke test PASSED: message status is 'read'.")
+                        return 0
+                    _log_error(
+                        f"Smoke test FAILED: terminal status "
+                        f"{notification.status!r}."
+                    )
+                    return 3
+
+    _log_error("Smoke test FAILED: timed out waiting for 'read' status.")
+    return 4
+
+
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    """Parse CLI arguments. Exactly one mode must be selected."""
+    parser = argparse.ArgumentParser(
+        description="GREEN-API MAX smoke test (never sends without confirmation)."
+    )
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
+        "--check-only",
+        action="store_true",
+        help="Validate configuration and run CheckAccount only; never sends.",
+    )
+    mode.add_argument(
+        "--send-and-wait-read",
+        action="store_true",
+        help="Send one message after confirmation and wait for the read status.",
+    )
+    return parser.parse_args(argv)
+
+
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = parse_args(argv)
     try:
         if args.check_only:
-            return run_check_only(client, TEST_PHONE_NUMBER)
-        elif args.send_and_wait_read:
-            return run_send_and_wait_read(
-                client,
-                phone=TEST_PHONE_NUMBER,
-                message=TEST_MESSAGE,
-                timeout_seconds=SMOKE_TEST_TIMEOUT_SECONDS,
-            )
-    finally:
-        client.close()
-
-    return 1
+            return run_check_only()
+        return run_send_and_wait_read()
+    except ConfigError as exc:
+        _log_error(str(exc))
+        return 2
 
 
 if __name__ == "__main__":
     sys.exit(main())
-
-
