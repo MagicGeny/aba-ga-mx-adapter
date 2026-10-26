@@ -1,239 +1,143 @@
-# Adapter Contract: GREEN-API MAX (`aba-ga-mx-adapter`)
-
-This document defines how a future `aba-ga-mx-adapter` service talks to
-**MAX** through the **GREEN-API HTTP API**.
-
-Scope: outbound text messaging only. No chatbot, no webhooks, no inbound
-processing.
-
-## 1. Transport and credentials
-
-The adapter uses plain HTTPS calls to GREEN-API. No socket, no browser,
-no persistent session.
-
-Configuration comes from the environment:
-
-| Variable | Required | Description |
-|---|---|---|
-| `GREEN_API_BASE_URL` | yes | GREEN-API base URL, e.g. `https://7107.api.greenapi.com` |
-| `GREEN_API_ID_INSTANCE` | yes | Instance numeric ID (digits only) |
-| `GREEN_API_TOKEN_INSTANCE` | yes | Instance API token |
-| `TEST_PHONE_NUMBER` | for smoke test | Recipient phone, digits only (see §3) |
-| `TEST_MESSAGE` | for smoke test | Test message text |
-| `SMOKE_TEST_TIMEOUT_SECONDS` | no | Wait timeout for the smoke test, default `180` |
-
-### 1.1 URL pattern
-
-All method calls use the GREEN-API v3 `waInstance` URL shape:
-
-```text
-{BASE_URL}/waInstance{ID_INSTANCE}/{METHOD}/{TOKEN}
-```
-
-Examples:
-
-```text
-{base}/waInstance1234567/checkAccount/token_abc
-{base}/waInstance1234567/sendMessage/token_abc
-{base}/waInstance1234567/receiveNotification/token_abc
-{base}/waInstance1234567/deleteNotification/token_abc/8888888   # receiptId appended
-```
-
-The API token is part of the URL path. Clients **must never** log full
-request URLs. Log only the method name (e.g. `checkAccount`) or a masked
-URL.
-
-## 2. Pre-flight: notification settings
-
-Before the adapter (or the smoke test) can observe message statuses, the
-instance must be configured:
-
-- `webhookUrl` — **empty**. With HTTP-API polling (`receiveNotification`),
-  no custom webhook URL may be set; otherwise the server skips queueing
-  notifications for polling.
-- Outgoing status notifications — **enabled**:
-  - `outgoingMessageWebhook`
-  - `outgoingAPIMessageWebhook`
-  - `outgoingWebhook`
-
-Either the console or the `SetSettings` method may be used to set these.
-Without them the adapter will never receive `outgoingMessageStatus`
-notifications.
-
-Use a **dedicated test instance with an empty notification queue** for the
-smoke test. Stray queue items abort the run by design.
-
-## 3. Addressing and validation
-
-GREEN-API MAX addresses a recipient by `chatId`, derived from the phone
-number — often identical to the digits themselves.
-
-Client-side rules (server enforces the rest and returns `400` on
-mismatch):
-
-- `TEST_PHONE_NUMBER` (and any recipient phone) must be **7–15 digits**,
-  no `+`, no spaces, no dashes (`^\d{7,15}$`).
-- GREEN-API MAX in particular accepts only 11–12 digit numbers with the
-  `7` (Russia) or `375` (Belarus) prefixes. The server is authoritative
-  here, not the client.
-
-## 4. Sending flow
-
-The canonical send sequence is:
-
-```text
-CheckAccount -> SendMessage -> ReceiveNotification -> DeleteNotification
-```
-
-### 4.1 CheckAccount
-
-`POST {base}/waInstance{id}/checkAccount/{token}`
-
-Request body (`phoneNumber` is an **integer** per GREEN-API docs):
-
-```json
-{ "phoneNumber": 79991234567 }
-```
-
-Optional `force: true` bypasses the ~2-hour cache. Default `force` is
-`false` — the adapter uses the cached value.
-
-Success responses:
-
-```json
-{ "exist": true, "chatId": "79991234567", "fromCache": false }
-{ "exist": true, "chatId": "79991234567", "fromCache": true }
-{ "exist": false, "chatId": "", "fromCache": false }
-```
-
-Rules:
-
-- Proceed to `SendMessage` **only** when `exist == true` **and**
-  `chatId` is a non-empty string.
-- Sometimes GREEN-API answers with `{"status": false, "reason": "..."}`
-  (instance starting, rate limit). That is **not** proof of absence —
-  treat it as an error and stop.
-
-### 4.2 SendMessage
-
-`POST {base}/waInstance{id}/sendMessage/{token}`
-
-Request body:
-
-```json
-{ "chatId": "79991234567", "message": "...text, up to 4000 chars, UTF-8..." }
-```
-
-Success response:
-
-```json
-{ "idMessage": "BAE5F7B9E1234567" }
-```
-
-- A `200` + `idMessage` means the message was **accepted** — not
-  delivered, not read.
-- Never retry automatically after a send timeout: the server may have
-  accepted the request even if the response was lost. Check the
-  recipient device first.
-
-Error codes to expect: `400` (validation/length), `403` (suspended),
-`404` (instance not found), `409` (registration/synchronization),
-`422` (invalid recipient), `429`/`469` (rate limit), `500+` (server).
-
-### 4.3 ReceiveNotification (HTTP-API polling)
-
-`GET {base}/waInstance{id}/receiveNotification/{token}?receiveTimeout=N`
-
-- `receiveTimeout`: long-poll wait, **5–60 s** (server clamps shorter
-  values down to 5).
-
-Each notification arrives as an envelope:
-
-```json
-{
-  "receiptId": 1234567,
-  "body": {
-    "typeWebhook": "outgoingMessageStatus",
-    "chatId": "79991234567",
-    "instanceData": {"idInstance": 3100000000, "wid": "...", "typeInstance": "..."},
-    "timestamp": 1755591519,
-    "idMessage": "BAE5F7B9E1234567",
-    "status": "read",
-    "description": "..."
-  }
-}
-```
-
-- An empty/timeout response is `null` or `{}` — keep polling.
-- Only notifications with `body.typeWebhook == "outgoingMessageStatus"`
-  and `body.idMessage` equal to the sent message's `idMessage` belong to
-  this send. Anything else is **unrelated**: report it, do **not**
-  delete it, stop.
-
-### 4.4 OutgoingMessageStatus values
-
-`body.status` is one of (per GREEN-API docs):
-
-| Status | Meaning | Adapter action |
-|---|---|---|
-| `delivered` | Reached the device | Log, keep waiting |
-| `read` | Opened by recipient | **Success** — finish |
-| `failed` | Terminal failure | Stop with error |
-| `noAccount` | Recipient has no MAX account | Stop with error |
-| `notInGroup` | Bad target | Stop with error |
-
-`read` is the only success state. `delivered` is intermediate. Any other
-value is treated as intermediate for now (logged, kept waiting) so a new
-server-side value cannot silently mean something it doesn't.
-
-### 4.5 DeleteNotification
-
-`DELETE {base}/waInstance{id}/deleteNotification/{token}/{receiptId}`
-
-Response:
-
-```json
-{ "result": true }
-```
-
-Rules:
-
-- Delete **only** notifications already classified as related to the
-  current send, identified by `receiptId`.
-- Never delete unrelated items.
-- If deletion reports `result: false`, log the reason and continue —
-  a stale queue item is a warning, not a success-blocker.
-
-## 5. Happy path (end-to-end)
-
-1. `CheckAccount` for the recipient phone; require `exist == true` and a
-   valid `chatId`.
-2. Operator confirms by typing `SEND` (interactive only — no
-   unattended sending).
-3. `SendMessage` to the `chatId`; capture `idMessage`.
-4. Poll `ReceiveNotification`, deleting and classifying each related
-   notification, until `status == "read"` for that `idMessage`
-   (or timeout / terminal status → failure).
-
-## 6. What is out of scope
-
-- Chatbots / inbound message processing.
-- Webhook receiver mode (`webhookUrl` stays empty in this design).
-- Attachments, media, buttons, polls, location, contacts.
-- Queue-based multi-tenant plumbing (RabbitMQ topics, result queues).
-- Retry-with-backoff policy beyond "don't auto-retry a timed-out send".
-
-## 7. Reference links (official GREEN-API v3)
-
-- Console: https://console.green-api.com
-- CheckAccount: https://green-api.com/v3/docs/api/service/CheckAccount/
-- SendMessage: https://green-api.com/v3/docs/api/sending/SendMessage/
-- Notification format: https://green-api.com/v3/docs/api/receiving/notifications-format/
-- ReceiveNotification: https://green-api.com/v3/docs/api/receiving/technology-http-api/ReceiveNotification/
-- DeleteNotification: https://green-api.com/v3/docs/api/receiving/technology-http-api/DeleteNotification/
-- OutgoingMessageStatus: https://green-api.com/v3/docs/api/receiving/notifications-format/statuses/OutgoingMessageStatus/
-- HTTP status codes: https://green-api.com/v3/docs/api/GreenAPI_ERRORS/
-- Instance settings: https://green-api.com/v3/docs/api/account/
-- Phone validation rules: https://green-api.com/v3/docs/api/sending/SendMessage/#phone
-
-
+# Aba-ga-mx-adapter ↔ Orchestrator Contract
+
+This document describes the proposed technical contract between the future
+`aba-ga-mx-adapter` (Python) and the existing Go orchestrator.
+
+The scope of this stage is **contract + smoke test only**. RabbitMQ consumers,
+the long-running adapter worker, and changes to the Go orchestrator are **not
+implemented** in this stage. Everything RabbitMQ-related below is documentation
+for the future implementation.
+
+---
+
+## 1. Outgoing Task Contract
+
+Tasks are published by the Go orchestrator to the adapter. Each adapter
+process will eventually be configured for one `tenant_account_id` and one
+GREEN-API instance. The following fields are **already used** by the existing
+Go orchestrator and must be understood by the adapter:
+
+| Field                  | Type    | Description |
+|------------------------|---------|-------------|
+| `task_id`              | string  | Unique task identifier (UUID). |
+| `campaign_id`          | string  | Campaign identifier (UUID). |
+| `tenant_id`            | string  | Tenant identifier. |
+| `tenant_account_id`    | string  | The sender-account identity (UUID from `tenant_accounts.id`). Also used to scope the per-account RabbitMQ queue and routing key. |
+| `account_id`           | string  | GREEN-API instance id (`idInstance`). |
+| `messenger`            | string  | Messenger family, e.g. `"MAX"`. |
+| `messenger_type`       | string  | Messenger sub-type, e.g. `"v3"`. |
+| `phone`                | string  | Recipient phone number as digits only (no `+`, spaces, or separators). GREEN-API MAX `CheckAccount` accepts only 11 digits beginning with `7` (Russian numbers) or 12 digits beginning with `375` (Belarusian numbers), e.g. `79991234567` or `375291234567`. |
+| `message_text`         | string  | Text content of the message to send. |
+| `use_chat_id`          | bool    | If `true` and a valid `chat_id` is provided, send directly to that chat. |
+| `chat_id`              | string  | GREEN-API chat identifier to send to directly (used only when `use_chat_id=true`). |
+| `contact_type`         | string  | Type of contact for the recipient (e.g. `"client"`, `"admin"`). |
+
+### Attachment-related fields
+
+The following fields exist on outgoing tasks for attachment delivery:
+
+| Field                  | Type    | Description |
+|------------------------|---------|-------------|
+| `attachments`          | array   | List of attachment descriptors. |
+| `attachment.type`      | string  | Attachment type (image, document, etc.). |
+| `attachment.url`       | string  | Public URL of the attachment. |
+
+> ⚠️ **Out of scope for this stage.** Attachment delivery is not implemented.
+> The smoke test covers text messages only.
+
+### Expected Future Behavior
+
+- If `use_chat_id=true` and a valid `chat_id` is provided, the adapter MAY send
+  directly to that chat without calling `CheckAccount`.
+- Otherwise, the adapter MUST resolve the recipient using `CheckAccount` with
+  the task's `phone` field.
+- Before calling `CheckAccount`, the adapter MUST validate `phone` as digits
+  only: 11 digits beginning with `7` (Russian numbers) or 12 digits beginning
+  with `375` (Belarusian numbers). Arbitrary 7–15 digit numbers are NOT valid
+  MAX `CheckAccount` inputs.
+- **The adapter MUST NOT send a message when `CheckAccount` returns
+  `exist=false`** (the recipient has no MAX account on this instance).
+- `CheckAccount` MUST NOT use `force=true` by default — the default caching
+  behavior is sufficient (GREEN-API caches `ChatExist` results for 2 hours).
+
+---
+
+## 2. Result Contract
+
+After processing a task (or when a notification is received), the adapter
+publishes a result to the results queue. These fields are **already consumed**
+by the existing Go orchestrator:
+
+| Field                  | Type    | Description |
+|------------------------|---------|-------------|
+| `target_id`            | string  | Target identifier within the campaign. |
+| `campaign_id`          | string  | Campaign identifier (UUID). |
+| `tenant_id`            | string  | Tenant identifier. |
+| `tenant_account_id`    | string  | Sender-account identity (UUID). |
+| `account_id`           | string  | GREEN-API instance id (`idInstance`). |
+| `phone_number`         | string  | Recipient phone number. |
+| `status`               | string  | Delivery status. See status mapping below. |
+| `reply_text`           | string  | Content of an inbound reply (if applicable). |
+| `error_code`           | string  | Error code, if the operation failed. |
+| `error_message`        | string  | Human-readable error message. |
+| `timestamp`            | string  | ISO-8601 timestamp of the result. |
+| `chat_id`              | string  | GREEN-API chat identifier of the recipient. |
+| `messenger_type`       | string  | Messenger sub-type, e.g. `"v3"`. |
+
+### Proposed Extension: `provider_message_id`
+
+| Field                  | Type    | Description |
+|------------------------|---------|-------------|
+| `provider_message_id`  | string  | GREEN-API `idMessage` for the outgoing message. |
+
+> ⚠️ **Proposed extension.** Adding `provider_message_id` to the result
+> contract **may require a change to the Go orchestrator** to persist and
+> correlate this field. This field is NOT implemented in this stage. Do not
+> modify the orchestrator now.
+
+### Status Mapping
+
+| GREEN-API event / status          | Orchestrator `status` | Notes |
+|-----------------------------------|-----------------------|-------|
+| `SendMessage` API response success | *(accepted — not yet delivered)* | The request was accepted by GREEN-API. Do NOT report as `delivered` or `viewed`. |
+| OutgoingMessageStatus `delivered`  | `delivered`            | The message was delivered to the recipient's MAX app. |
+| OutgoingMessageStatus `read`       | `viewed`               | The recipient opened/read the message. |
+| Incoming customer message          | `replied`              | *(Future — not implemented in this stage.)* |
+| OutgoingMessageStatus `failed`     | `failed`               | Server-side send error. |
+| OutgoingMessageStatus `noAccount`  | `failed`               | Recipient has no MAX account. |
+| OutgoingMessageStatus `notInGroup` | `failed`               | Sender not in group chat. |
+
+---
+
+## 3. RabbitMQ Integration Contract
+
+> ⚠️ **Documentation only.** RabbitMQ is not implemented in this stage.
+
+### Exchange & Routing
+
+| Component              | Value |
+|------------------------|-------|
+| Direct exchange        | `tasks.messages.direct` |
+| Send routing key       | `account.<tenant_account_id>` |
+| Send queue name        | `tasks.messages.send.account.<tenant_account_id>` |
+| Admin notification queue | `tasks.messages.tenant_admin_notify.account.<tenant_account_id>` |
+| Results queue          | `tasks.messages.results_replies_queue` |
+
+### Future Adapter Configuration
+
+Each adapter process will eventually be configured for:
+
+- One `tenant_account_id` — determines which send queue and routing key to
+  consume from.
+- One GREEN-API instance — determined by `account_id` (`idInstance`),
+  `GREEN_API_ID_INSTANCE`, and `GREEN_API_TOKEN_INSTANCE`.
+
+### Notes
+
+- The results queue (`tasks.messages.results_replies_queue`) is currently a
+  shared, non-vendored queue. A future stage may vendor it per account, the
+  same way the send and admin-notify queues are vendored today.
+- The legacy shared admin-notification queue
+  (`tasks.messages.tenant_admin_notify`) is documented for context but is no
+  longer used; per-account isolation uses
+  `tasks.messages.tenant_admin_notify.account.<tenant_account_id>`.
