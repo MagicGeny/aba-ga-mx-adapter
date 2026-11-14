@@ -1,0 +1,23 @@
+.env
+.env.*
+!.env.example
+
+.venv/
+venv/
+env/
+# A virtualenv created directly in the repository root.
+/pyvenv.cfg
+/bin/
+/lib/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+.idea/
+.vscode/
+.DS_Store
